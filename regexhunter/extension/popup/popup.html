@@ -1,0 +1,209 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Regex Hunter</title>
+  <link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <div class="app-container">
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <svg class="logo" viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <circle cx="16" cy="16" r="15" fill="#0f172a" stroke="#38bdf8" stroke-width="1.5"/>
+          <circle cx="16" cy="16" r="10" stroke="#38bdf8" stroke-width="1" stroke-dasharray="2 2"/>
+          <circle cx="16" cy="16" r="4" fill="#ef4444"/>
+          <line x1="16" y1="2" x2="16" y2="30" stroke="#38bdf8" stroke-width="1.2" opacity="0.6"/>
+          <line x1="2" y1="16" x2="30" y2="16" stroke="#38bdf8" stroke-width="1.2" opacity="0.6"/>
+        </svg>
+        <div class="brand-text">
+          <h1>Regex Hunter</h1>
+          <span class="subtext">Bug Bounty Recon & Extraction</span>
+        </div>
+      </div>
+
+      <div class="server-badge" id="serverBadge" title="Click to configure daemon">
+        <span class="status-dot disconnected" id="serverDot"></span>
+        <span class="status-text" id="serverText">Connecting...</span>
+      </div>
+    </header>
+
+    <!-- State & Controls -->
+    <section class="control-panel">
+      <div class="state-indicator">
+        <span class="label">STATUS:</span>
+        <span class="current-state state-stopped" id="currentState">STOPPED</span>
+      </div>
+      <div class="control-buttons">
+        <button id="btnStart" class="btn btn-start" title="Start Regex Monitoring">▶ START</button>
+        <button id="btnPause" class="btn btn-pause" title="Pause Monitoring (keeps rules)">⏸ PAUSE</button>
+        <button id="btnStop" class="btn btn-stop" title="Stop Monitoring">⏹ STOP</button>
+      </div>
+    </section>
+
+    <!-- Metrics Grid -->
+    <section class="metrics-grid">
+      <div class="metric-card">
+        <span class="metric-num" id="activeRulesCount">0</span>
+        <span class="metric-title">Active Rules</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-num highlight" id="sessionMatchesCount">0</span>
+        <span class="metric-title">Session Matches</span>
+      </div>
+      <div class="metric-card">
+        <span class="metric-num" id="totalMatchesCount">0</span>
+        <span class="metric-title">Server Total</span>
+      </div>
+    </section>
+
+    <!-- Navigation Tabs -->
+    <nav class="tabs-nav">
+      <button class="tab-btn active" data-tab="tabRules">Rules</button>
+      <button class="tab-btn" data-tab="tabLive">Live Stream <span class="tab-badge" id="liveStreamBadge">0</span></button>
+      <button class="tab-btn" data-tab="tabTester">Regex Tester</button>
+    </nav>
+
+    <!-- TAB 1: Rules Manager -->
+    <section class="tab-content active" id="tabRules">
+      <div class="section-toolbar">
+        <div class="search-box">
+          <input type="text" id="searchRulesInput" placeholder="Filter rules by tag/pattern...">
+        </div>
+        <div class="action-bar">
+          <button id="btnPresets" class="btn btn-sm btn-secondary" title="Load curated bug bounty regexes">⚡ Presets</button>
+          <button id="btnAddRule" class="btn btn-sm btn-primary">+ Add</button>
+          <button id="btnSettings" class="btn-icon" title="Daemon Settings">⚙</button>
+        </div>
+      </div>
+
+      <div class="rules-list" id="rulesList">
+        <!-- Rendered dynamically -->
+      </div>
+
+      <div class="rules-footer">
+        <button id="btnExportRules" class="btn-text">Export JSON</button>
+        <button id="btnImportRules" class="btn-text">Import JSON</button>
+        <input type="file" id="importFileInput" accept=".json" class="hidden">
+      </div>
+    </section>
+
+    <!-- TAB 2: Live Stream -->
+    <section class="tab-content" id="tabLive">
+      <div class="section-toolbar">
+        <span class="toolbar-title">Intercepted Matches (Live)</span>
+        <div class="action-bar">
+          <button id="btnClearLiveMatches" class="btn btn-sm btn-secondary">Clear</button>
+        </div>
+      </div>
+      <div class="live-stream-list" id="liveStreamList">
+        <div class="empty-state">No matches captured in this session yet.<br>Click START and browse websites or search GitHub.</div>
+      </div>
+    </section>
+
+    <!-- TAB 3: Regex Tester Playground -->
+    <section class="tab-content" id="tabTester">
+      <div class="tester-container">
+        <div class="form-group">
+          <label for="testerRegex">Test Regex Pattern:</label>
+          <input type="text" id="testerRegex" placeholder="e.g. https?:\/\/([a-z0-9-]+\.)*api\.netflix\.com\/">
+        </div>
+        <div class="form-group">
+          <label for="testerInput">Sample HTML / Text:</label>
+          <textarea id="testerInput" rows="5" placeholder="Paste sample page source or URLs here to test..."></textarea>
+        </div>
+        <div class="tester-results-header">
+          <span>Matches Found: <strong id="testerMatchCount" class="highlight">0</strong></span>
+        </div>
+        <div class="tester-preview" id="testerPreview">
+          <em>Match results will be listed here...</em>
+        </div>
+      </div>
+    </section>
+
+    <!-- Add/Edit Rule Modal -->
+    <div class="modal-overlay hidden" id="ruleModal">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3 id="modalTitle">Add New Regex</h3>
+          <button class="btn-close" id="btnCloseRuleModal">&times;</button>
+        </div>
+        <form id="ruleForm">
+          <input type="hidden" id="ruleId">
+          <div class="form-group">
+            <label for="ruleTag">Tag / Identifier</label>
+            <input type="text" id="ruleTag" placeholder="e.g. netflix-api" required pattern="^[a-zA-Z0-9_\-]{1,64}$">
+            <small class="hint">Alphanumeric, dashes, underscores only.</small>
+          </div>
+          <div class="form-group">
+            <label for="rulePattern">Regular Expression</label>
+            <textarea id="rulePattern" rows="3" placeholder="e.g. https?:\/\/api\.netflix\.com\/" required></textarea>
+            <div class="regex-error hidden" id="regexError"></div>
+          </div>
+          <div class="form-group">
+            <label for="ruleDesc">Description (Optional)</label>
+            <input type="text" id="ruleDesc" placeholder="e.g. Netflix production API endpoints">
+          </div>
+          <div class="form-check">
+            <label>
+              <input type="checkbox" id="ruleCaseInsensitive" checked> Case Insensitive (i)
+            </label>
+          </div>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-secondary" id="btnCancelRule">Cancel</button>
+            <button type="submit" class="btn btn-primary" id="btnSaveRule">Save Regex</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+    <!-- Presets Selector Modal -->
+    <div class="modal-overlay hidden" id="presetsModal">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Curated Bug Bounty Presets</h3>
+          <button class="btn-close" id="btnClosePresetsModal">&times;</button>
+        </div>
+        <p class="hint">Select presets to add to your hunting rules:</p>
+        <div class="presets-list" id="presetsList">
+          <!-- Preset items dynamically rendered -->
+        </div>
+        <div class="modal-actions">
+          <button type="button" class="btn btn-secondary" id="btnCancelPresets">Cancel</button>
+          <button type="button" class="btn btn-primary" id="btnApplyPresets">Import Selected</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Server Settings Modal -->
+    <div class="modal-overlay hidden" id="settingsModal">
+      <div class="modal-card">
+        <div class="modal-header">
+          <h3>Local Daemon Settings</h3>
+          <button class="btn-close" id="btnCloseSettingsModal">&times;</button>
+        </div>
+        <form id="settingsForm">
+          <div class="form-group">
+            <label for="serverUrl">Server API URL</label>
+            <input type="url" id="serverUrl" value="http://127.0.0.1:8787" required>
+          </div>
+          <div class="form-group">
+            <label for="serverToken">Bearer Auth Token</label>
+            <input type="text" id="serverToken" placeholder="Paste token from terminal output">
+            <small class="hint">Required for authorization and origin security.</small>
+          </div>
+          <div class="test-result hidden" id="testConnResult"></div>
+          <div class="modal-actions">
+            <button type="button" class="btn btn-secondary" id="btnTestConn">Test Connection</button>
+            <button type="submit" class="btn btn-primary">Save Settings</button>
+          </div>
+        </form>
+      </div>
+    </div>
+
+  </div>
+  <script src="popup.js"></script>
+</body>
+</html>

@@ -1,0 +1,823 @@
+#!/usr/bin/env python3
+"""
+ifcp - Cache Poisoning Fuzzer
+Tests HTTP endpoints for cache poisoning via common unkeyed headers.
+Uses a unique ?cp_probe=TOKEN per test to isolate cache keys — real users are never affected.
+
+Usage: echo "https://site.com/page" | ifcp
+       cat urls.txt | ifcp -H "Cookie: session=abc123"
+       cat urls.txt | ifcp -j
+"""
+
+import sys
+import argparse
+import json
+import random
+import string
+import hashlib
+import requests
+import http.client
+import re
+import os
+from datetime import datetime
+from collections import Counter, defaultdict
+from urllib.parse import urlparse, urlunparse, quote
+
+# --- Monkey patch http.client to bypass url-encoding for raw backslashes ---
+orig_putrequest = http.client.HTTPConnection.putrequest
+
+def custom_putrequest(self, method, url, **kwargs):
+    if "___BACKSLASH___" in url:
+        url = url.replace("___BACKSLASH___", "\\")
+    return orig_putrequest(self, method, url, **kwargs)
+
+http.client.HTTPConnection.putrequest = custom_putrequest
+
+# ─── Color & Styling System ──────────────────────────────────────────────────
+
+class Style:
+    def __init__(self, enabled=True):
+        # Auto-disable color if NO_COLOR env var is set
+        if os.getenv("NO_COLOR"):
+            enabled = False
+        self.enabled = enabled
+
+    def _wrap(self, code, text):
+        return f"\033[{code}m{text}\033[0m" if self.enabled else str(text)
+
+    # Styles
+    def bold(self, t): return self._wrap("1", t)
+    def dim(self, t): return self._wrap("2", t)
+    def underline(self, t): return self._wrap("4", t)
+
+    # Foreground colors
+    def red(self, t): return self._wrap("91", t)
+    def green(self, t): return self._wrap("92", t)
+    def yellow(self, t): return self._wrap("93", t)
+    def blue(self, t): return self._wrap("94", t)
+    def magenta(self, t): return self._wrap("95", t)
+    def cyan(self, t): return self._wrap("96", t)
+    def white(self, t): return self._wrap("97", t)
+    def gray(self, t): return self._wrap("90", t)
+
+    # Badges
+    def badge_high(self):
+        return self._wrap("97;41;1", " HIGH ") if self.enabled else "[HIGH]"
+
+    def badge_medium(self):
+        return self._wrap("30;43;1", " MEDIUM ") if self.enabled else "[MEDIUM]"
+
+    def badge_low(self):
+        return self._wrap("30;46;1", " LOW ") if self.enabled else "[LOW]"
+
+    def badge_info(self):
+        return self._wrap("30;47;1", " INFO ") if self.enabled else "[INFO]"
+
+    def badge_cache_hit(self):
+        return self._wrap("97;42;1", " CACHE HIT ") if self.enabled else "[CACHE HIT]"
+
+    def badge_cache_miss(self):
+        return self._wrap("97;100;1", " UNCACHED ") if self.enabled else "[UNCACHED]"
+
+    def badge_reflect(self):
+        return self._wrap("97;44;1", " REFLECTION ") if self.enabled else "[REFLECTION]"
+
+    def badge_cpdos(self):
+        return self._wrap("97;45;1", " CPDoS ") if self.enabled else "[CPDoS]"
+
+
+
+# Headers to test for cache poisoning
+CP_HEADERS_LIST = [
+    "Contact",
+    "From",
+    "Referer",
+    "X-Original-Url",
+    "X-Wap-Profile",
+    "Profile",
+    "X-Arbitrary",
+    "X-Http-Destinationurl",
+    "X-Forwarded",
+    "X-Forwarded-Proto",
+    "X-Forwarded-Host",
+    "X-Forwarded-For",
+    "X-Forwarded-Server",
+    "X-Forwarded-Scheme",
+    "X-Host",
+    "x-features",
+    "X-Http-Host-Override",
+    "Cluster-Client-Ip",
+    "True-Client-Ip",
+    "Client-Ip",
+    "X-Client-Ip",
+    "X-Real-Ip",
+    "X-Remote-Ip",
+    "X-Originating-Ip",
+    "X-Proxyuser-Ip",
+    "X-Remote-Addr",
+    "Cf-Connecting_ip",
+    "Forwarded",
+]
+
+# Encoding tests for URL normalization CPDoS detection
+ENCODING_TESTS = {
+    "encoded_question_mark": ("%3F", "?"),   # /%3Fkey=val  vs /?key=val
+    "encoded_hash":          ("%23", "#"),   # /%23key      vs /#key
+    "encoded_slash":         ("%2F", "/"),   # /path%2Fextra vs /path/extra
+    "backslash_slash":       ("\\", "/"),    # /path\extra vs /path/extra
+    "encoded_backslash_slash": ("%5C", "/"), # /path%5Cextra vs /path/extra
+}
+
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description='ifcp - Advanced Web Cache Poisoning & Unkeyed Header Reflection Fuzzer',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  echo "https://target.com/page" | ifcp
+  cat urls.txt | ifcp -H "Cookie: session=xyz" -v
+  cat urls.txt | ifcp --url-normalization -u
+  cat urls.txt | ifcp -j > findings.jsonl
+        """
+    )
+    parser.add_argument('-H', '--header', action='append', dest='headers',
+                        help='Custom header to include in all requests (e.g. -H "Authorization: Bearer ...")')
+    parser.add_argument('-w', '--wordlist', type=str,
+                        help='File containing custom headers to test (one per line)')
+    parser.add_argument('-t', '--timeout', type=int, default=10,
+                        help='Request timeout in seconds (default: 10)')
+    parser.add_argument('-x', '--proxy', type=str,
+                        help='HTTP/SOCKS proxy URL (e.g., http://127.0.0.1:8080)')
+    parser.add_argument('-u', '--unique', action='store_true',
+                        help='Output only the single highest-severity finding per host/subdomain')
+    parser.add_argument('-un', '--url-normalization', action='store_true',
+                        help='Enable URL normalization CPDoS detection')
+    parser.add_argument('-v', '--verbose', action='store_true',
+                        help='Display live scanning progress and verbose logs on stderr')
+    parser.add_argument('-q', '--quiet', action='store_true',
+                        help='Quiet mode: suppress banner and scan progress, show only findings')
+    parser.add_argument('--no-banner', action='store_true',
+                        help='Suppress ASCII banner')
+    parser.add_argument('--no-color', action='store_true',
+                        help='Disable colored terminal output')
+    parser.add_argument('-j', '--json', action='store_true',
+                        help='Output results in JSON Lines (NDJSON) format')
+    return parser.parse_args()
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
+
+def parse_headers(header_list):
+    headers = {}
+    if header_list:
+        for h in header_list:
+            if ':' in h:
+                key, value = h.split(':', 1)
+                headers[key.strip()] = value.strip()
+    return headers
+
+
+def rand_token(k=8):
+    return ''.join(random.choices(string.ascii_lowercase + string.digits, k=k))
+
+
+def analyze_cache(resp):
+    """
+    Check response headers for cache indicators and determine if it was an active cache hit.
+    Returns:
+        is_hit (bool): True if headers positively confirm a cache hit
+        evidence_str (str): Summary string of present cache headers
+        cache_data (dict): Dict of matching header-value pairs
+    """
+    cache_header_keys = [
+        "X-Cache", "CF-Cache-Status", "Age", "X-Cache-Status",
+        "X-Served-By", "X-Proxy-Cache", "X-Varnish", "Fastly-Debug-Digest",
+        "Akamai-Cache-Status", "X-Drupal-Cache", "X-Rack-Cache"
+    ]
+    cache_data = {}
+    is_hit = False
+
+    for h in cache_header_keys:
+        if h in resp.headers:
+            val = resp.headers[h].strip()
+            cache_data[h] = val
+            v_upper = val.upper()
+            if "HIT" in v_upper or "REVALIDATED" in v_upper:
+                is_hit = True
+            elif h.lower() == "age":
+                try:
+                    if int(val) > 0:
+                        is_hit = True
+                except ValueError:
+                    pass
+
+    evidence_parts = [f"{k}: {v}" for k, v in cache_data.items()]
+    evidence_str = ", ".join(evidence_parts) if evidence_parts else "None detected"
+
+    return is_hit, evidence_str, cache_data
+
+
+def resp_signature(resp):
+    """Return a tuple (status_code, body_hash) to fingerprint a response."""
+    body_hash = hashlib.md5(resp.content).hexdigest()
+    return (resp.status_code, body_hash)
+
+
+def build_probe_urls(base_url, token, strategy):
+    """Generate cache manipulation probe variations."""
+    separator = '&' if '?' in base_url else '?'
+    clean_base = base_url.rstrip('/')
+    if strategy == "standard_query":
+        return f"{base_url}{separator}cp_probe={token}"
+    elif strategy == "unkeyed_query":
+        return f"{base_url}{separator}{token}=1"
+    else:  # path_based
+        return f"{clean_base}/{token}"
+
+
+def send_request(session, url, headers, timeout):
+    return session.get(
+        url,
+        headers=headers,
+        timeout=timeout,
+        allow_redirects=False
+    )
+
+
+def make_payload(header, token):
+    """Craft a header-appropriate payload value."""
+    h = header.lower()
+    if any(k in h for k in ("url", "referer", "profile", "destinationurl")):
+        return f"https://{token}.com"
+    if h == "forwarded":
+        return f"for={token}"
+    if h in ("contact", "from"):
+        return f"root@{token}"
+    if h == "x-forwarded-scheme":
+        return "http"
+    return f"{token}_hit"
+
+
+# ─── Core Scan Logic ──────────────────────────────────────────────────────────
+
+def get_indicators(response, pld):
+    """
+    Analyze response for reflections, redirects, and injection points.
+    Returns a deduplicated list of indicators.
+    """
+    inds = []
+    loc = response.headers.get('Location', '')
+
+    if pld == 'http':
+        if loc.lower().startswith('http://'):
+            inds.append('Location Header (HTTP Downgrade)')
+        return inds
+
+    text = response.text
+    hdrs = str(response.headers)
+
+    if pld in loc:
+        short_loc = (loc[:55] + '...') if len(loc) > 58 else loc
+        inds.append(f'Location Header Redirect ({short_loc})')
+
+    if re.search(r'(?i)(?:src|href)\s*=["\'][^"\']*?' + re.escape(pld), text):
+        inds.append('Resource Injection (src/href attribute)')
+
+    if '<script' in text and pld in text:
+        inds.append('Script Block Reflection')
+
+    if pld in text:
+        inds.append('Response Body Reflection')
+    elif pld in hdrs:
+        inds.append('Response Header Reflection')
+
+    return list(dict.fromkeys(inds))
+
+
+def check_cache_poisoning(base_url, base_headers, timeout, session, headers_list=None, verbose=False):
+    """
+    Test URL for cache poisoning via common unkeyed headers.
+    """
+    findings = []
+    BATCH_SIZE = 20
+    test_headers = headers_list if headers_list else CP_HEADERS_LIST
+
+    for strategy in ("standard_query", "unkeyed_query", "path_based"):
+        for batch_start in range(0, len(test_headers), BATCH_SIZE):
+            batch = test_headers[batch_start:batch_start + BATCH_SIZE]
+            token_base = f"cp_{rand_token(6)}"
+            probe_url = build_probe_urls(base_url, token_base, strategy)
+
+            poison_headers = base_headers.copy()
+            payloads_map = {}
+            for header in batch:
+                safe_header = header.replace('-', '_').lower()
+                header_token = f"{token_base}_{safe_header}"
+                payload = make_payload(header, header_token)
+                payloads_map[header] = payload
+                poison_headers[header] = payload
+
+            try:
+                # Step 1: Warm-up poisoned response
+                reflection_resp = send_request(session, probe_url, poison_headers, timeout)
+                send_request(session, probe_url, poison_headers, timeout)
+
+                # Step 2: Clean probe to check if poisoned response was cached
+                probe_resp = send_request(session, probe_url, base_headers, timeout)
+                is_hit, cache_evidence, _ = analyze_cache(probe_resp)
+
+                # Step 3: Analyze per header
+                for header, payload in payloads_map.items():
+                    reflection_inds = get_indicators(reflection_resp, payload)
+                    probe_inds = get_indicators(probe_resp, payload)
+
+                    if probe_inds:
+                        severity = "HIGH" if is_hit else "MEDIUM"
+                        issue_type = "Cache Poisoning" if is_hit else "Cache Poisoning (Unkeyed Parameter/Path)"
+                        findings.append({
+                            "url":            base_url,
+                            "probe_url":      probe_url,
+                            "header":         header,
+                            "payload":        payload,
+                            "strategy":       strategy,
+                            "severity":       severity,
+                            "is_cached":      is_hit,
+                            "cache_evidence": cache_evidence,
+                            "issue_type":     issue_type,
+                            "details":        ", ".join(probe_inds),
+                            "status_code":    probe_resp.status_code,
+                            "content_length": len(probe_resp.content)
+                        })
+                        if verbose:
+                            print(f"[+] [FOUND CP] {base_url} via {header} (Strategy: {strategy}, Hit: {is_hit})", file=sys.stderr)
+
+                    elif reflection_inds:
+                        findings.append({
+                            "url":            base_url,
+                            "probe_url":      probe_url,
+                            "header":         header,
+                            "payload":        payload,
+                            "strategy":       strategy,
+                            "severity":       "LOW",
+                            "is_cached":      False,
+                            "cache_evidence": cache_evidence,
+                            "issue_type":     "Header Reflection",
+                            "details":        ", ".join(reflection_inds),
+                            "status_code":    reflection_resp.status_code,
+                            "content_length": len(reflection_resp.content)
+                        })
+                        if verbose:
+                            print(f"[*] [REFLECT] {base_url} via {header} (Reflection only)", file=sys.stderr)
+
+            except requests.exceptions.Timeout:
+                if verbose:
+                    print(f"[!] Timeout: {base_url} ({strategy})", file=sys.stderr)
+            except requests.exceptions.RequestException as e:
+                if verbose:
+                    print(f"[!] Error: {base_url} ({strategy}) -> {e}", file=sys.stderr)
+            except Exception as e:
+                if verbose:
+                    print(f"[!] Unexpected error on {base_url}: {e}", file=sys.stderr)
+
+    if not findings:
+        return None
+
+    # Deduplicate findings by grouping strategies
+    grouped = {}
+    for f in findings:
+        key = (f['url'], f['header'], f['issue_type'])
+        if key not in grouped:
+            grouped[key] = f
+            grouped[key]['strategies'] = [f['strategy']]
+        else:
+            if f['strategy'] not in grouped[key]['strategies']:
+                grouped[key]['strategies'].append(f['strategy'])
+
+    dedup = []
+    for g in grouped.values():
+        g['strategy'] = ", ".join(g['strategies'])
+        del g['strategies']
+        dedup.append(g)
+
+    return dedup
+
+
+def _run_normalization_attempt(base_url, encoding_name, encoded_char, normal_char,
+                               base_headers, timeout, session):
+    parsed = urlparse(base_url)
+    clean_path = parsed.path.rstrip('/') or '/'
+
+    token_base   = f"cpn_{rand_token(6)}"
+    token_attack = f"cpn_{rand_token(6)}"
+
+    if encoding_name == 'encoded_question_mark':  # %3F
+        baseline_url = f"{parsed.scheme}://{parsed.netloc}{clean_path}?{token_base}=1"
+        encoded_url  = f"{parsed.scheme}://{parsed.netloc}{clean_path}%3F{token_attack}=1"
+        verify_url   = f"{parsed.scheme}://{parsed.netloc}{clean_path}?{token_attack}=1"
+    elif encoding_name == 'encoded_hash':  # %23
+        baseline_url = f"{parsed.scheme}://{parsed.netloc}{clean_path}?cb={token_base}"
+        encoded_url  = f"{parsed.scheme}://{parsed.netloc}{clean_path}%23{token_attack}"
+        verify_url   = f"{parsed.scheme}://{parsed.netloc}{clean_path}?cb={token_attack}"
+    elif encoding_name == 'encoded_slash':  # %2F
+        baseline_url = f"{parsed.scheme}://{parsed.netloc}{clean_path}/{token_base}"
+        encoded_url  = f"{parsed.scheme}://{parsed.netloc}{clean_path}%2F{token_attack}"
+        verify_url   = f"{parsed.scheme}://{parsed.netloc}{clean_path}/{token_attack}"
+    elif encoding_name in ('backslash_slash', 'encoded_backslash_slash'):  # \ or %5C
+        attack_char = '___BACKSLASH___' if encoding_name == 'backslash_slash' else '%5C'
+        original_query = f"?{parsed.query}" if parsed.query else ""
+        separator = "&" if parsed.query else "?"
+
+        last_slash_idx = clean_path.rfind('/')
+        if last_slash_idx != -1:
+            attack_path = clean_path[:last_slash_idx] + attack_char + clean_path[last_slash_idx+1:]
+        else:
+            attack_path = clean_path + attack_char
+
+        baseline_url = f"{parsed.scheme}://{parsed.netloc}{clean_path}{original_query}{separator}cpn={token_base}"
+        encoded_url  = f"{parsed.scheme}://{parsed.netloc}{attack_path}{original_query}{separator}cpn={token_attack}"
+        verify_url   = f"{parsed.scheme}://{parsed.netloc}{clean_path}{original_query}{separator}cpn={token_attack}"
+    else:
+        return None
+
+    try:
+        baseline_resp = send_request(session, baseline_url, base_headers, timeout)
+        baseline_sig  = resp_signature(baseline_resp)
+
+        enc_resp1 = send_request(session, encoded_url, base_headers, timeout)
+        enc_resp2 = send_request(session, encoded_url, base_headers, timeout)
+        attack_sig = resp_signature(enc_resp1)
+        cached_flag, cache_evidence, _ = analyze_cache(enc_resp2)
+
+        verify_resp = send_request(session, verify_url, base_headers, timeout)
+        verify_sig  = resp_signature(verify_resp)
+
+        poisoned = (
+            verify_sig[0] == attack_sig[0]
+            and verify_sig[0] != baseline_sig[0]
+        )
+
+        return (poisoned, baseline_sig, attack_sig, verify_sig, cached_flag, cache_evidence,
+                baseline_url, encoded_url, verify_url)
+
+    except requests.exceptions.RequestException as e:
+        return None
+
+
+def check_url_normalization(base_url, base_headers, timeout, session, verbose=False):
+    findings = []
+
+    for enc_name, (enc_char_encoded, enc_char_normal) in ENCODING_TESTS.items():
+        result1 = _run_normalization_attempt(
+            base_url, enc_name, enc_char_normal, enc_char_encoded,
+            base_headers, timeout, session
+        )
+        if result1 is None:
+            continue
+
+        poisoned1, base_sig1, atk_sig1, ver_sig1, cached1, cache_evid1, _, enc_url1, ver_url1 = result1
+        if not poisoned1:
+            continue
+
+        result2 = _run_normalization_attempt(
+            base_url, enc_name, enc_char_normal, enc_char_encoded,
+            base_headers, timeout, session
+        )
+
+        cross_validated = False
+        cached2 = False
+        if result2 is not None:
+            poisoned2 = result2[0]
+            cached2   = result2[4]
+            cross_validated = poisoned2
+
+        if cross_validated:
+            severity = "HIGH" if (cached1 or cached2) else "MEDIUM"
+        else:
+            severity = "MEDIUM" if cached1 else "LOW"
+
+        findings.append({
+            "url":              base_url,
+            "probe_url":        enc_url1.replace("___BACKSLASH___", "\\"),
+            "verify_url":       ver_url1,
+            "header":           f"URL Encoding ({enc_name})",
+            "payload":          enc_char_encoded,
+            "strategy":         enc_name,
+            "severity":         severity,
+            "is_cached":        cached1 or cached2,
+            "cache_evidence":   cache_evid1,
+            "cross_validated":  cross_validated,
+            "issue_type":       "URL Normalization (CPDoS)",
+            "details":          (
+                f"Baseline: HTTP {base_sig1[0]} → "
+                f"Attack: HTTP {atk_sig1[0]} → "
+                f"Verify: HTTP {ver_sig1[0]} "
+                f"(Cross-Validated: {cross_validated})"
+            ),
+            "status_code":      ver_sig1[0]
+        })
+        if verbose:
+            print(f"[+] [CPDoS FOUND] {base_url} via {enc_name} (Verified: {cross_validated})", file=sys.stderr)
+
+    return findings if findings else None
+
+
+# ─── Output Rendering ─────────────────────────────────────────────────────────
+
+def print_banner(style):
+    banner = f"""
+{style.cyan(style.bold("   __ ___ "))}
+{style.cyan(style.bold("  / // _/___  ___ "))}  {style.bold("ifcp")} {style.dim("v2.0 — Web Cache Poisoning & Reflection Fuzzer")}
+{style.cyan(style.bold(" / // _// _ \\/ _ \\"))}  {style.gray("Deterministic payload isolation & smart cache analysis")}
+{style.cyan(style.bold("/_//_/ / .__/\\___/"))}
+{style.cyan(style.bold("      /_/         "))}
+"""
+    print(banner.strip("\n"), file=sys.stderr)
+    print(style.dim("─" * 80), file=sys.stderr)
+
+
+def render_results_json(results):
+    """Output results in NDJSON format, one clean JSON object per line."""
+    for findings in results:
+        for item in findings:
+            entry = {
+                "timestamp":      datetime.utcnow().isoformat() + "Z",
+                "target":         urlparse(item["url"]).netloc,
+                "url":            item["url"],
+                "type":           item.get("issue_type", "Cache Poisoning").lower().replace(" ", "_"),
+                "severity":       item.get("severity", "UNKNOWN"),
+                "header":         item["header"],
+                "payload":        item["payload"],
+                "strategy":       item.get("strategy", ""),
+                "is_cached":      item.get("is_cached", False),
+                "cache_evidence": item.get("cache_evidence", ""),
+                "details":        item.get("details", ""),
+                "probe_url":      item.get("probe_url", ""),
+                "status_code":    item.get("status_code", None)
+            }
+            if "cross_validated" in item:
+                entry["cross_validated"] = item["cross_validated"]
+            if "verify_url" in item:
+                entry["verify_url"] = item["verify_url"]
+            print(json.dumps(entry))
+
+
+def render_results(results, style, tested_count):
+    """Render beautifully structured terminal output with cards and summaries."""
+    if not results:
+        return
+
+    # Flatten and globally deduplicate
+    all_grouped = {}
+    for findings in results:
+        for item in findings:
+            key = (item['url'], item['header'], item.get('issue_type'))
+            if key not in all_grouped:
+                new_item = item.copy()
+                strats = [s.strip() for s in new_item['strategy'].split(',')]
+                new_item['_strats'] = set(strats)
+
+                details = [d.strip() for d in new_item.get('details', '').split(',') if d.strip()]
+                new_item['_details'] = set(details)
+
+                all_grouped[key] = new_item
+            else:
+                existing = all_grouped[key]
+                strats = [s.strip() for s in item['strategy'].split(',')]
+                existing['_strats'].update(strats)
+
+                details = [d.strip() for d in item.get('details', '').split(',') if d.strip()]
+                existing['_details'].update(details)
+
+    grouped_by_target = defaultdict(list)
+    total_cp = 0
+    total_hr = 0
+    total_cpdos = 0
+    sev_counts = Counter()
+    header_counts = Counter()
+
+    for item in all_grouped.values():
+        item['strategy'] = ", ".join(sorted(item['_strats']))
+        item['details'] = ", ".join(sorted(item['_details']))
+
+        issue_type = item.get("issue_type", "Cache Poisoning")
+        sev = item.get("severity", "LOW")
+        sev_counts[sev] += 1
+        header_counts[item['header']] += 1
+
+        if "CPDoS" in issue_type:
+            total_cpdos += 1
+        elif "Cache Poisoning" in issue_type:
+            total_cp += 1
+        else:
+            total_hr += 1
+
+        parsed = urlparse(item['url'])
+        target_domain = parsed.netloc if parsed.netloc else item['url']
+        grouped_by_target[target_domain].append(item)
+
+    print()
+    # Render Findings Grouped by Target
+    for domain, items in grouped_by_target.items():
+        # Target Header
+        finding_label = f"{len(items)} finding" if len(items) == 1 else f"{len(items)} findings"
+        header_title = f" 🎯 TARGET: {domain}  ({finding_label}) "
+        header_box_len = max(80, len(header_title) + 4)
+        pad = header_box_len - len(header_title) - 2
+
+        print(style.cyan(f"╭─{header_title}{'─' * max(0, pad)}╮"))
+        print(style.cyan(f"╰{'─' * (header_box_len - 1)}╯"))
+
+        for item in items:
+            issue_type = item.get("issue_type", "Cache Poisoning")
+            severity   = item.get("severity", "LOW")
+            is_hit     = item.get("is_cached", False)
+            header     = item.get("header", "")
+            strategy   = item.get("strategy", "standard_query")
+            details    = item.get("details", "")
+            payload    = item.get("payload", "")
+            probe_url  = item.get("probe_url", "")
+            base_url   = item.get("url", "")
+            cache_evid = item.get("cache_evidence", "None detected")
+            status_code= item.get("status_code", "")
+
+            # Choose badges
+            if severity == "HIGH":
+                sev_badge = style.badge_high()
+                title_color = style.red
+            elif severity == "MEDIUM":
+                sev_badge = style.badge_medium()
+                title_color = style.yellow
+            else:
+                sev_badge = style.badge_low()
+                title_color = style.blue
+
+            if is_hit:
+                hit_badge = style.badge_cache_hit()
+            elif "CPDoS" in issue_type:
+                hit_badge = style.badge_cpdos()
+            else:
+                hit_badge = style.badge_reflect()
+
+            # Render Card
+            card_title = f" {sev_badge} {title_color(style.bold(issue_type))} via {style.bold(header)} "
+            card_line_len = 80 - len(f"┌── {issue_type} via {header} ")
+            print(f"┌──{card_title}{'─' * max(2, card_line_len)}")
+            print(f"│ {style.dim('Type      :')} {title_color(issue_type)} {style.dim(f'(Severity: {severity})')}  {hit_badge}")
+            print(f"│ {style.dim('Header    :')} {style.bold(header)}: {style.cyan(payload)}")
+            print(f"│ {style.dim('Strategy  :')} {style.yellow(strategy)}")
+
+            if status_code:
+                status_str = f"HTTP {status_code}"
+                if item.get("content_length"):
+                    status_str += f" ({item['content_length']:,} bytes)"
+                print(f"│ {style.dim('Response  :')} {status_str}")
+
+            if "CPDoS" in issue_type:
+                print(f"│ {style.dim('Flow      :')} {details}")
+                if "verify_url" in item:
+                    print(f"│ {style.dim('Verify URL:')} {item['verify_url']}")
+            else:
+                print(f"│ {style.dim('Evidence  :')} {details}")
+                print(f"│ {style.dim('Cache Info:')} {cache_evid}")
+
+            print(f"│ {style.dim('Base URL  :')} {base_url}")
+            print(f"│ {style.dim('Probe URL :')} {style.dim(probe_url)}")
+            print(f"└{'─' * 79}\n")
+
+    # Render Executive Summary Report
+    print(style.cyan("═" * 80))
+    print(style.bold(style.cyan("                            SCAN SUMMARY REPORT                            ")))
+    print(style.cyan("═" * 80))
+    print(f"  {style.bold('URLs Tested            :')} {tested_count}")
+    print(f"  {style.bold('Unique Target Hosts    :')} {len(grouped_by_target)}")
+    print(f"  {style.bold('Total Findings         :')} {len(all_grouped)}")
+    print(f"    • {style.red(style.bold('High Severity (Cache Hit)'))} : {sev_counts['HIGH']}")
+    print(f"    • {style.yellow(style.bold('Medium Severity          '))} : {sev_counts['MEDIUM']}")
+    print(f"    • {style.blue(style.bold('Low Severity (Reflection)'))} : {sev_counts['LOW']}")
+    print(style.dim("─" * 80))
+    print(f"  {style.bold('Vulnerability Categories:')}")
+    print(f"    • Cache Poisoning        : {total_cp}")
+    print(f"    • URL Normalization CPDoS: {total_cpdos}")
+    print(f"    • Header Reflection Only : {total_hr}")
+
+    if header_counts:
+        print(style.dim("─" * 80))
+        print(f"  {style.bold('Top Headers Reflected / Poisoned:')}")
+        for hdr, count in header_counts.most_common(8):
+            print(f"    • {style.cyan(hdr.ljust(25))} : {count} occurrence(s)")
+
+    print(style.cyan("═" * 80))
+
+
+# ─── Entry Point ──────────────────────────────────────────────────────────────
+
+def main():
+    args      = parse_args()
+    headers   = parse_headers(args.headers)
+    use_color = not args.no_color
+    style     = Style(enabled=use_color)
+    session   = requests.Session()
+
+    # Show banner in interactive mode unless suppressed or in quiet/json mode
+    if not args.no_banner and not args.quiet and not args.json and sys.stderr.isatty():
+        print_banner(style)
+
+    # Load custom header wordlist if provided
+    custom_headers = None
+    if args.wordlist:
+        try:
+            with open(args.wordlist, 'r') as f:
+                raw_headers = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+            valid_re = re.compile(r'^[A-Za-z0-9\-]+$')
+            custom_headers = [h for h in raw_headers if valid_re.match(h)]
+            skipped = len(raw_headers) - len(custom_headers)
+            if not custom_headers:
+                print(f"[!] Wordlist '{args.wordlist}' has no valid headers.", file=sys.stderr)
+                sys.exit(1)
+            msg = f"[*] Loaded {len(custom_headers)} headers from {args.wordlist}"
+            if skipped:
+                msg += f" (skipped {skipped} invalid)"
+            if not args.quiet and not args.json:
+                print(style.gray(msg), file=sys.stderr)
+        except FileNotFoundError:
+            print(f"[!] Wordlist file not found: {args.wordlist}", file=sys.stderr)
+            sys.exit(1)
+
+    if args.proxy:
+        import urllib3
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+        session.proxies = {"http": args.proxy, "https": args.proxy}
+        session.verify  = False
+        if not args.quiet and not args.json:
+            print(style.gray(f"[*] Proxy enabled: {args.proxy}"), file=sys.stderr)
+
+    if sys.stdin.isatty():
+        print(style.yellow("Usage: echo 'https://site.com/page' | ifcp"), file=sys.stderr)
+        print(style.yellow("       cat urls.txt | ifcp -H 'Cookie: session=abc'"), file=sys.stderr)
+        print(style.yellow("       cat urls.txt | ifcp -j > findings.jsonl"), file=sys.stderr)
+        sys.exit(1)
+
+    results = []
+    tested  = 0
+    vulnerable_hosts = set()
+
+    for line in sys.stdin:
+        url = line.strip()
+        if url and url.startswith('http'):
+            try:
+                host = urlparse(url).netloc
+            except Exception:
+                host = url
+
+            if args.unique and host in vulnerable_hosts:
+                continue
+
+            tested += 1
+            if args.verbose:
+                print(f"[*] [{tested}] Testing: {url}", file=sys.stderr)
+
+            current_findings = []
+
+            finding = check_cache_poisoning(
+                url, headers, args.timeout, session, custom_headers, verbose=args.verbose
+            )
+            if finding:
+                current_findings.extend(finding)
+
+            if args.url_normalization:
+                norm_finding = check_url_normalization(
+                    url, headers, args.timeout, session, verbose=args.verbose
+                )
+                if norm_finding:
+                    current_findings.extend(norm_finding)
+
+            if current_findings:
+                if args.unique:
+                    severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "UNKNOWN": 3}
+                    current_findings.sort(key=lambda x: severity_order.get(x.get("severity", "UNKNOWN"), 3))
+                    results.append([current_findings[0]])
+                    vulnerable_hosts.add(host)
+                else:
+                    results.append(current_findings)
+
+    if tested == 0:
+        print("No valid URLs supplied.", file=sys.stderr)
+        sys.exit(1)
+
+    if not results:
+        if args.json:
+            pass  # Empty output for clean JSON Lines pipelines
+        else:
+            print(style.green(f"\n[-] No cache poisoning or header reflection vulnerabilities detected across {tested} URL(s)."))
+    else:
+        if args.json:
+            render_results_json(results)
+        else:
+            render_results(results, style, tested)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Regex Hunter — Test Target Page</title>
+  <style>
+    body { font-family: monospace; padding: 20px; background: #0f172a; color: #f8fafc; }
+    h1 { color: #38bdf8; }
+    .box { background: #1e293b; padding: 15px; border-radius: 8px; margin: 15px 0; border: 1px solid #334155; }
+    code { color: #4ade80; }
+  </style>
+</head>
+<body>
+  <h1>Regex Hunter Test Page</h1>
+  <p>If Regex Hunter is set to <strong>RUNNING</strong>, it will automatically detect the endpoints below!</p>
+
+  <div class="box">
+    <h3>Netflix API Endpoints:</h3>
+    <p>Production API: <code>https://api.netflix.net/</code></p>
+    <p>Staging API: <code>https://foo.api.netflix.net/v1/health</code></p>
+    <p>Internal API: <code>https://bar.api.netflix.com/</code></p>
+  </div>
+
+  <div class="box">
+    <h3>AWS Assets:</h3>
+    <p>Access Key ID: <code>AKIAIOSFODNN7EXAMPLE</code></p>
+    <p>S3 Bucket: <code>confidential-backups.s3.us-west-2.amazonaws.com</code></p>
+  </div>
+
+  <div class="box">
+    <h3>GitHub Token:</h3>
+    <p>Personal Access Token: <code>ghp_A1B2C3D4E5F6G7H8I9J0K1L2M3N4O5P6Q7R8</code></p>
+  </div>
+
+  <script>
+    // Inline script test endpoint
+    const internalConfig = {
+      apiGateway: "https://secure.api.netflix.com/graphql",
+      backupStorage: "https://my-data-vault.s3.amazonaws.com"
+    };
+    console.log("Test page loaded", internalConfig);
+  </script>
+</body>
+</html>

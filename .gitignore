@@ -1,0 +1,81 @@
+# ==========================================
+# Binaries & Compiled Executables
+# ==========================================
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+inscope.exe
+.inscope.exe
+inscope/inscope
+inscope/inscope.exe
+urlfinder
+*.test
+*.out
+
+# ==========================================
+# Target Scope & Engagement Output
+# ==========================================
+.scope
+*.scope
+out/
+results/
+**/results/
+tmp/
+**/tmp/
+.tmp/
+*.log
+
+# ==========================================
+# Node.js & Databases
+# ==========================================
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.db
+*.sqlite
+*.sqlite3
+agent_knowledge.db
+
+# ==========================================
+# Python Artifacts & Caches
+# ==========================================
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+.pytest_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# ==========================================
+# Browser Automation & MCP Cache
+# ==========================================
+.playwright-mcp/
+
+# ==========================================
+# Test Dumps & Temporary Scans
+# ==========================================
+regexhunter/test.txt/
+regexhunter/ip.txt
+
+# ==========================================
+# OS & Editor Artifacts
+# ==========================================
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+*~

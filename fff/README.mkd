@@ -1,0 +1,79 @@
+# fff - Fairly Fast Fetcher
+
+> [!NOTE]
+> This document was written by AI.
+
+Requests a list of URLs provided on `stdin` concurrently and writes headers and response bodies to disk.
+
+The main idea is to launch requests with controlled concurrency and delay without waiting for slow responses to block execution.
+
+---
+
+## Installation
+
+```bash
+cd fff
+go build -o fff.exe .
+```
+
+---
+
+## Features
+
+- **High-Speed Concurrency**: Adjustable concurrency (`-c`) and delay (`-d`) to maximize throughput while respecting rate limits.
+- **Smart JS Beautification (`--js-beautify`)**: Automatically detects JavaScript responses (via URL path, file extension, or `Content-Type: application/javascript`) and reformats minified/bundled code in-place using `js-beautify`.
+- **Organized Storage Hierarchy**: Saves responses to `<output>/<domain>/<path>/<file>-body` and `<file>-headers`.
+- **Filtering Options**: Filter by HTTP status code (`-s`), match body contents (`-M`), skip HTML (`--ignore-html`), or ignore empty responses (`--ignore-empty`).
+
+---
+
+## Usage
+
+### Basic Fetch & Save All
+```bash
+cat urls.txt | fff -S -o out
+```
+
+### Save Only 200 OK Responses & Auto-Beautify JavaScript
+```bash
+cat js_endpoints.txt | fff -s 200 --js-beautify -o out
+```
+
+### Custom Concurrency, Headers & Proxy
+```bash
+cat urls.txt | fff -s 200 -c 50 -d 50 -H "Authorization: Bearer <token>" -x http://127.0.0.1:8080 -o out
+```
+
+---
+
+## CLI Options
+
+```text
+Options:
+  -b, --body <data>         Request body
+  -c, --concurrency <num>   Maximum concurrent requests (default: 20, 0 for unlimited)
+  -d, --delay <delay>       Delay between issuing requests (ms) (default: 100)
+  -H, --header <header>     Add a header to the request (can be specified multiple times)
+      --header-only         Save only response headers, skip saving body
+      --ignore-html         Don't save HTML files; useful when looking for non-HTML files only
+      --ignore-empty        Don't save empty files
+      --js-beautify         Format and beautify saved JavaScript files using js-beautify
+  -k, --keep-alive          Use HTTP Keep-Alive
+  -m, --method              HTTP method to use (default: GET, or POST if body is specified)
+  -M, --match <string>      Save responses that include <string> in the body
+  -o, --output <dir>        Directory to save responses in (will be created, default: out)
+  -s, --save-status <code>  Save responses with given status code (can be specified multiple times)
+  -S, --save                Save all responses
+  -t, --timeout <time>      HTTP request timeout (e.g. 10s, 5000ms, or seconds, default: 10s)
+  -x, --proxy <proxyURL>    Use the provided HTTP proxy
+```
+
+---
+
+## Tuning
+
+On Unix systems with heavy concurrency, you may want to increase your open file descriptor limit:
+
+```bash
+ulimit -n 16384
+```

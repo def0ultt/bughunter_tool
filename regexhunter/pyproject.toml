@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "regexhunter"
+version = "1.0.0"
+description = "Chrome Extension + Local Daemon for Bug Bounty Recon & Regex Extraction"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "starlette>=0.28.0",
+    "uvicorn>=0.20.0",
+    "pydantic>=2.0.0",
+    "rich>=12.0.0",
+]
+
+[tool.setuptools]
+packages = ["regexhunter"]
+
+[project.scripts]
+regexhunter = "regexhunter.cli:main"
+

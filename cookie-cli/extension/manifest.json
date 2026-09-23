@@ -1,0 +1,11 @@
+{
+  "manifest_version": 3,
+  "name": "Cookie Bridge for AI",
+  "version": "1.0",
+  "description": "Allows a local CLI tool to request cookies for specific domains.",
+  "permissions": ["cookies", "tabs", "identity"],
+  "host_permissions": ["<all_urls>"],
+  "background": {
+    "service_worker": "background.js"
+  }
+}

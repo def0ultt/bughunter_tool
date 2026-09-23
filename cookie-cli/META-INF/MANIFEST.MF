@@ -1,0 +1,11 @@
+Manifest-Version: 1.0
+Implementation-Title: burp-mcp
+Implementation-Version: 1.2.2
+Implementation-Vendor: PortSwigger
+Built-By: daniel.allen
+Built-Date: 2026-05-25T18:18:06.919562Z
+Built-JDK: 25.0.1 (Eclipse Adoptium 25.0.1+8-LTS)
+Created-By: Gradle 9.2.0
+Main-Class: net.portswigger.mcp.ExtensionBase
+Multi-Release: true
+
